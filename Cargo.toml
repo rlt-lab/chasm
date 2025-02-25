@@ -2,9 +2,9 @@
 name = "chasm"
 version = "0.1.0"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Ryan Taito <ryantaito@gmail.com>"]
 description = "A roguelike game inspired by Caves of Qud"
-repository = "https://github.com/yourusername/chasm"
+repository = "https://github.com/rlt-lab/chasm"
 
 [dependencies]
 bevy = { version = "0.12", default-features = true }
