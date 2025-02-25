@@ -28,7 +28,7 @@
 5.c. druid
 5.d. desert sage
 5.e. dwarf mage
-6.f. warlock
+5.f. warlock
 
 7.a. farmer (wheat thresher)
 7.b. farmer (scythe)

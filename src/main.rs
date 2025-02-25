@@ -1,8 +1,16 @@
 use bevy::prelude::*;
-use bevy::window::WindowMode;
+use bevy::window::{WindowMode, WindowPosition, MonitorSelection};
 use bevy::render::camera::ScalingMode;
-use bevy::window::MonitorSelection;
-use bevy::sprite::TextureAtlas;
+use bevy::sprite::{TextureAtlas, TextureAtlasSprite};
+use rand::seq::SliceRandom;
+use crate::components::{Position, Player, Npc, Tile, DialogBox};
+use crate::map::{TileMap, TileType, MAP_WIDTH, MAP_HEIGHT};
+use crate::input::InputState;
+use crate::visibility::{PlayerVisibility, update_visibility, update_tile_visibility, setup_visibility_map};
+use crate::systems::check_dialog_distance;
+use crate::assets::{SpriteAssets, TextureAtlases, load_sprite_assets};
+use crate::biome::{BiomeManager, BiomeType};
+use bevy::text::{Text2dBundle, Text, TextStyle, TextAlignment};
 
 mod components;
 mod map;
@@ -11,6 +19,11 @@ mod input;
 mod ui;
 mod visibility;
 mod systems;
+mod assets;
+mod biome;
+
+// Use the TILE_SIZE from the input module
+use crate::input::TILE_SIZE;
 
 // Camera control component
 #[derive(Component)]
@@ -30,29 +43,13 @@ impl Default for CameraControl {
     }
 }
 
-use crate::components::{Position, Player, Tile, Npc, DialogBox}; 
-use rand::seq::SliceRandom;
-use crate::map::{TileMap, MAP_WIDTH, MAP_HEIGHT, TileType};
-use crate::systems::check_dialog_distance;
-use bevy::sprite::TextureAtlasSprite;
-use crate::input::InputState;
-use crate::visibility::{PlayerVisibility, update_visibility, update_tile_visibility, setup_visibility_map};
-use bevy::text::{Text2dBundle, Text, TextStyle, TextAlignment};
-
-const TILE_SIZE: f32 = 32.0;
-
 #[derive(States, Debug, Clone, Copy, Eq, PartialEq, Hash, Default)]
 enum GameState {
     #[default]
     InGame,
 }
 
-#[derive(Resource)]
-struct GameAssets {
-    character_sheet: Handle<TextureAtlas>,
-    floor_tiles: Handle<TextureAtlas>,
-}
-
+// GameAssets struct has been replaced by the new asset management system in the assets module
 
 fn main() {
     App::new()
@@ -75,7 +72,8 @@ fn main() {
         .init_resource::<InputState>()
         .add_systems(Startup, setup)
         .add_systems(OnEnter(GameState::InGame), (
-            spawn_game_world,
+            initialize_biome_manager,
+            spawn_game_world.after(initialize_biome_manager),
             setup_visibility_map.after(spawn_game_world)
         ))
         .add_systems(
@@ -91,7 +89,7 @@ fn main() {
                 handle_npc_interaction,
                 render_dialog_boxes,
                 regenerate_map_system.after(crate::input::handle_input),
-                spawn_game_world
+                handle_map_regeneration
                     .after(regenerate_map_system)
                     .run_if(resource_exists::<TileMap>())
                     .run_if(on_event::<RegenerateMapEvent>()),
@@ -104,7 +102,7 @@ fn main() {
 fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    mut texture_atlases: ResMut<Assets<TextureAtlas>>,
+    texture_atlases: ResMut<Assets<TextureAtlas>>,
 ) {
     // Camera
     let map = TileMap::new();
@@ -125,49 +123,33 @@ fn setup(
         CameraControl::default(),
     ));
     
-    // Load character sprite sheet
-    let character_handle = asset_server.load("sprites/rogues.png");
-    let character_atlas = TextureAtlas::from_grid(
-        character_handle,
-        Vec2::new(32.0, 32.0),  // assuming 32x32 sprites
-        16, 16,                 // 16x16 grid
-        None, None
-    );
-    let character_atlas_handle = texture_atlases.add(character_atlas);
-
-    // Load tiles sprite sheet
-    let tiles_handle = asset_server.load("sprites/tiles.png");
-    let tiles_atlas = TextureAtlas::from_grid(
-        tiles_handle,
-        Vec2::new(32.0, 32.0),  // assuming 32x32 sprites
-        16, 16,                 // 16x16 grid
-        None, None
-    );
-    let tiles_atlas_handle = texture_atlases.add(tiles_atlas);
-
-    // Store the atlas handles as a resource
-    commands.insert_resource(GameAssets {
-        character_sheet: character_atlas_handle,
-        floor_tiles: tiles_atlas_handle,
-    });
+    // Load all sprite assets
+    if let Err(e) = load_sprite_assets(&mut commands, asset_server, texture_atlases) {
+        eprintln!("Error loading sprite assets: {}", e);
+    }
 
     // Create initial TileMap
     commands.insert_resource(map);
+    
+    // Initialize BiomeManager as a resource
+    commands.init_resource::<BiomeManager>();
 }
 
 fn spawn_game_world(
     mut commands: Commands,
-    game_assets: Res<GameAssets>,
+    texture_atlases: Res<TextureAtlases>,
+    sprite_assets: Res<SpriteAssets>,
     map: Res<TileMap>,
-    existing_entities: Query<Entity, Or<(With<Tile>, With<Player>)>>,
+    biome_manager: Res<BiomeManager>,
+    existing_entities: Query<Entity, Or<(With<Tile>, With<Player>, With<Npc>)>>,
 ) {
     // First, clean up any existing entities
     for entity in existing_entities.iter() {
         commands.entity(entity).despawn();
     }
-
+    
     // Then spawn new tiles and player
-    rendering::spawn_tiles(&mut commands, &map, &game_assets);
+    rendering::spawn_tiles(&mut commands, &map, &texture_atlases, &sprite_assets, Some(&biome_manager));
 
     // Find valid floor tiles for NPC spawn
     let floor_tiles: Vec<(i32, i32)> = (0..MAP_WIDTH as usize * MAP_HEIGHT as usize)
@@ -210,9 +192,9 @@ fn spawn_game_world(
         
     commands.spawn((
         SpriteSheetBundle {
-            texture_atlas: game_assets.character_sheet.clone(),
+            texture_atlas: texture_atlases.characters.clone(),
             sprite: TextureAtlasSprite {
-                index: 16, // Position 1.a in rogues tileset (sprite at 1,0)
+                index: crate::assets::get_character_sprite(&sprite_assets, "dwarf"),
                 ..default()
             },
             transform: Transform::from_xyz(
@@ -267,9 +249,9 @@ fn spawn_game_world(
         
     commands.spawn((
         SpriteSheetBundle {
-            texture_atlas: game_assets.character_sheet.clone(),
+            texture_atlas: texture_atlases.characters.clone(),
             sprite: TextureAtlasSprite {
-                index: 116, // Position 8.e in rogues tileset
+                index: crate::assets::get_character_sprite(&sprite_assets, "elderly man"),
                 ..default()
             },
             transform: Transform::from_xyz(
@@ -287,9 +269,9 @@ fn spawn_game_world(
     let spawn_pos = map.get_spawn_position();
     commands.spawn((
         SpriteSheetBundle {
-            texture_atlas: game_assets.character_sheet.clone(),
+            texture_atlas: texture_atlases.characters.clone(),
             sprite: TextureAtlasSprite {
-                index: 4 * 16 + 1, // Position 5.b for wizard
+                index: crate::assets::get_character_sprite(&sprite_assets, "male wizard"),
                 ..default()
             },
             transform: Transform::from_xyz(
@@ -323,13 +305,43 @@ fn regenerate_map_system(
     input_state: Res<InputState>,
     mut events: EventWriter<RegenerateMapEvent>,
 ) {
+    // Only proceed if SHIFT+R was pressed
     if !input_state.regenerate_map {
         return;
     }
     
+    // Generate a new map
     let new_map = TileMap::new();
+    
+    // Update the map resource
     commands.insert_resource(new_map);
+    
+    // Send an event to notify other systems
     events.send(RegenerateMapEvent);
+    
+    // Log that map regeneration was triggered
+    println!("Map regeneration triggered with SHIFT+R");
+}
+
+// Add a system to respond to the regenerate map event
+fn handle_map_regeneration(
+    mut commands: Commands,
+    texture_atlases: Res<TextureAtlases>,
+    sprite_assets: Res<SpriteAssets>,
+    map: Res<TileMap>,
+    biome_manager: Res<BiomeManager>,
+    existing_entities: Query<Entity, Or<(With<Tile>, With<Player>, With<Npc>)>>,
+    mut ev_regenerate: EventReader<RegenerateMapEvent>,
+) {
+    // Only proceed if we received a regenerate map event
+    if ev_regenerate.read().next().is_none() {
+        return;
+    }
+    
+    println!("Regenerating game world with new map");
+    
+    // Reuse the existing spawn_game_world function to clean up and respawn entities
+    spawn_game_world(commands, texture_atlases, sprite_assets, map, biome_manager, existing_entities);
 }
 
 fn update_camera_zoom(
@@ -464,4 +476,13 @@ fn render_dialog_boxes(
             ));
         }
     }
+}
+
+// System to initialize the BiomeManager with tile mappings
+fn initialize_biome_manager(
+    mut biome_manager: ResMut<BiomeManager>,
+    sprite_assets: Res<SpriteAssets>,
+) {
+    biome_manager.initialize_default_tiles(&sprite_assets.tile_sprites);
+    println!("Initialized BiomeManager with tile mappings");
 }

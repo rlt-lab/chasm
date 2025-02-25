@@ -1,6 +1,8 @@
 use bevy::prelude::*;
 use crate::map::{TileMap, TileType, MAP_WIDTH, MAP_HEIGHT};
-use crate::components::{Position, Player};
+use crate::components::{Position, Player, Tile};
+use crate::biome::TileWalkability;
+
 #[derive(Resource, Default)]
 pub struct InputState {
     pub up: bool,
@@ -11,7 +13,6 @@ pub struct InputState {
     pub attack: bool,
     pub regenerate_map: bool,
 }
-
 
 pub fn handle_input(
     keyboard: Res<Input<KeyCode>>,
@@ -32,6 +33,7 @@ pub fn move_player(
     mut query: Query<&mut Position, With<Player>>,
     input: Res<InputState>,
     tilemap: Res<TileMap>,
+    tile_query: Query<(&Position, &Tile), Without<Player>>,
 ) {
     for mut pos in &mut query {
         let mut new_pos = Position::new(pos.x, pos.y);
@@ -49,9 +51,34 @@ pub fn move_player(
         // Check if the new position is within bounds
         if new_pos.x >= 0 && new_pos.x < MAP_WIDTH as i32 &&
         new_pos.y >= 0 && new_pos.y < MAP_HEIGHT as i32 {
-            // Check if the new position would collide with a wall
-            if tilemap.tiles[new_pos.y as usize][new_pos.x as usize] != TileType::Wall {
-                // Apply the movement only if valid
+            // First check the basic map data
+            let tile_type = tilemap.tiles[new_pos.y as usize][new_pos.x as usize];
+            
+            // Default behavior based on tile type
+            let mut can_move = tile_type != TileType::Wall;
+            
+            // Check for more detailed walkability information from tile entities
+            for (tile_pos, tile) in tile_query.iter() {
+                if tile_pos.x == new_pos.x && tile_pos.y == new_pos.y {
+                    // Override with more specific walkability information
+                    can_move = match tile.walkability {
+                        TileWalkability::Walkable => true,
+                        TileWalkability::Blocked => false,
+                        TileWalkability::Door => {
+                            // Doors can be walked through if the player presses the interact key
+                            if input.interact {
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    break;
+                }
+            }
+            
+            // Apply the movement only if valid
+            if can_move {
                 pos.x = new_pos.x;
                 pos.y = new_pos.y;
             }
