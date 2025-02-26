@@ -1,7 +1,8 @@
 use bevy::prelude::*;
 use crate::map::{TileMap, TileType, MAP_WIDTH, MAP_HEIGHT};
-use crate::components::{Position, Player, Tile};
+use crate::components::{Position, Player, Tile, MovementDirection, PlayerAnimation};
 use crate::biome::TileWalkability;
+use crate::AnimationState;
 
 #[derive(Resource, Default)]
 pub struct InputState {
@@ -12,22 +13,104 @@ pub struct InputState {
     pub interact: bool,
     pub attack: bool,
     pub regenerate_map: bool,
-    pub move_direction: Option<Direction>,
+    pub last_key_press_time: f64,
+    pub last_direction: Option<MovementDirection>,
+    pub continuous_movement: bool,
     pub use_stairs_down: bool,
     pub use_stairs_up: bool,
 }
 
 pub fn handle_input(
     keyboard: Res<Input<KeyCode>>,
+    time: Res<Time>,
     mut input_state: ResMut<InputState>,
+    animation_state: Res<AnimationState>,
 ) {
-    input_state.up = keyboard.just_pressed(KeyCode::Up);
-    input_state.down = keyboard.just_pressed(KeyCode::Down);
-    input_state.left = keyboard.just_pressed(KeyCode::Left);
-    input_state.right = keyboard.just_pressed(KeyCode::Right);
-    input_state.interact = keyboard.just_pressed(KeyCode::E);
-    input_state.attack = keyboard.just_pressed(KeyCode::F);
-    input_state.regenerate_map = keyboard.pressed(KeyCode::ShiftLeft) && keyboard.just_pressed(KeyCode::R);
+    // Reset movement flags
+    input_state.up = false;
+    input_state.down = false;
+    input_state.left = false;
+    input_state.right = false;
+    input_state.interact = false;
+    input_state.attack = false;
+    input_state.regenerate_map = false;
+    
+    // Check for movement keys - only set flags if no animation is in progress
+    // or if we're handling continuous movement
+    let can_process_movement = !animation_state.animation_in_progress || input_state.continuous_movement;
+    
+    if can_process_movement {
+        if keyboard.just_pressed(KeyCode::W) || keyboard.just_pressed(KeyCode::Up) {
+            input_state.up = true;
+            input_state.last_key_press_time = time.elapsed_seconds_f64();
+            input_state.last_direction = Some(MovementDirection::Up);
+        }
+        if keyboard.just_pressed(KeyCode::S) || keyboard.just_pressed(KeyCode::Down) {
+            input_state.down = true;
+            input_state.last_key_press_time = time.elapsed_seconds_f64();
+            input_state.last_direction = Some(MovementDirection::Down);
+        }
+        if keyboard.just_pressed(KeyCode::A) || keyboard.just_pressed(KeyCode::Left) {
+            input_state.left = true;
+            input_state.last_key_press_time = time.elapsed_seconds_f64();
+            input_state.last_direction = Some(MovementDirection::Left);
+        }
+        if keyboard.just_pressed(KeyCode::D) || keyboard.just_pressed(KeyCode::Right) {
+            input_state.right = true;
+            input_state.last_key_press_time = time.elapsed_seconds_f64();
+            input_state.last_direction = Some(MovementDirection::Right);
+        }
+    }
+    
+    // Always track the last direction for continuous movement, even if we can't process movement yet
+    if keyboard.just_pressed(KeyCode::W) || keyboard.just_pressed(KeyCode::Up) {
+        input_state.last_direction = Some(MovementDirection::Up);
+        input_state.last_key_press_time = time.elapsed_seconds_f64();
+    }
+    if keyboard.just_pressed(KeyCode::S) || keyboard.just_pressed(KeyCode::Down) {
+        input_state.last_direction = Some(MovementDirection::Down);
+        input_state.last_key_press_time = time.elapsed_seconds_f64();
+    }
+    if keyboard.just_pressed(KeyCode::A) || keyboard.just_pressed(KeyCode::Left) {
+        input_state.last_direction = Some(MovementDirection::Left);
+        input_state.last_key_press_time = time.elapsed_seconds_f64();
+    }
+    if keyboard.just_pressed(KeyCode::D) || keyboard.just_pressed(KeyCode::Right) {
+        input_state.last_direction = Some(MovementDirection::Right);
+        input_state.last_key_press_time = time.elapsed_seconds_f64();
+    }
+    
+    // Check for continuous movement (holding keys)
+    input_state.continuous_movement = false;
+    if keyboard.pressed(KeyCode::W) || keyboard.pressed(KeyCode::Up) {
+        input_state.continuous_movement = true;
+        if input_state.last_direction.is_none() {
+            input_state.last_direction = Some(MovementDirection::Up);
+        }
+    }
+    if keyboard.pressed(KeyCode::S) || keyboard.pressed(KeyCode::Down) {
+        input_state.continuous_movement = true;
+        if input_state.last_direction.is_none() {
+            input_state.last_direction = Some(MovementDirection::Down);
+        }
+    }
+    if keyboard.pressed(KeyCode::A) || keyboard.pressed(KeyCode::Left) {
+        input_state.continuous_movement = true;
+        if input_state.last_direction.is_none() {
+            input_state.last_direction = Some(MovementDirection::Left);
+        }
+    }
+    if keyboard.pressed(KeyCode::D) || keyboard.pressed(KeyCode::Right) {
+        input_state.continuous_movement = true;
+        if input_state.last_direction.is_none() {
+            input_state.last_direction = Some(MovementDirection::Right);
+        }
+    }
+    
+    // Check for map regeneration (SHIFT+R)
+    if keyboard.pressed(KeyCode::ShiftLeft) && keyboard.just_pressed(KeyCode::R) {
+        input_state.regenerate_map = true;
+    }
     
     // Check for stair navigation
     input_state.use_stairs_down = keyboard.pressed(KeyCode::ControlLeft) && keyboard.just_pressed(KeyCode::S);
@@ -41,7 +124,13 @@ pub fn move_player(
     input: Res<InputState>,
     tilemap: Res<TileMap>,
     tile_query: Query<(&crate::map::TilePos, &Tile), Without<Player>>,
+    animation_state: Res<AnimationState>,
 ) {
+    // Skip movement if an animation is in progress
+    if animation_state.animation_in_progress {
+        return;
+    }
+
     for mut pos in &mut query {
         let mut new_pos = Position::new(pos.x, pos.y);
         
@@ -103,6 +192,36 @@ pub fn move_player(
                 pos.x = new_pos.x;
                 pos.y = new_pos.y;
             }
+        }
+    }
+}
+
+// Add a new system to queue up the next movement direction
+pub fn queue_next_movement(
+    keyboard: Res<Input<KeyCode>>,
+    animation_state: Res<AnimationState>,
+    mut player_query: Query<&mut PlayerAnimation, With<Player>>,
+) {
+    // Only queue movements if an animation is in progress
+    if !animation_state.animation_in_progress {
+        return;
+    }
+    
+    // Check for a player animation component
+    if let Ok(mut animation) = player_query.get_single_mut() {
+        // Check for movement keys and queue the direction
+        if keyboard.just_pressed(KeyCode::W) || keyboard.just_pressed(KeyCode::Up) {
+            animation.queued_direction = Some(MovementDirection::Up);
+            println!("Queued UP movement");
+        } else if keyboard.just_pressed(KeyCode::S) || keyboard.just_pressed(KeyCode::Down) {
+            animation.queued_direction = Some(MovementDirection::Down);
+            println!("Queued DOWN movement");
+        } else if keyboard.just_pressed(KeyCode::A) || keyboard.just_pressed(KeyCode::Left) {
+            animation.queued_direction = Some(MovementDirection::Left);
+            println!("Queued LEFT movement");
+        } else if keyboard.just_pressed(KeyCode::D) || keyboard.just_pressed(KeyCode::Right) {
+            animation.queued_direction = Some(MovementDirection::Right);
+            println!("Queued RIGHT movement");
         }
     }
 }

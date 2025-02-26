@@ -1,6 +1,8 @@
 use bevy::prelude::*;
 use rand::Rng;
 use rand::seq::SliceRandom;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 use crate::biome::BiomeType;
 use crate::assets::{SpriteAssets, TextureAtlases};
 use crate::visibility::{VisibilityMap, TileVisibility};
@@ -384,7 +386,18 @@ impl TileMap {
     
     // Create a new map for a specific level
     pub fn new_level(level: usize, previous_map: Option<&TileMap>) -> Self {
-        let mut rng = rand::thread_rng();
+        // Create a new RNG with a seed based on time to ensure different maps
+        // Use bitwise XOR instead of addition to avoid overflow
+        let time_component = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u64;
+        
+        let random_component = rand::random::<u64>();
+        let seed = time_component ^ random_component;
+        
+        let mut rng = StdRng::seed_from_u64(seed);
+        
         let (tiles, rooms, biomes, spawn_position) = Self::generate_map(&mut rng);
         
         let mut map = Self {
@@ -403,6 +416,8 @@ impl TileMap {
 
         // Add stairs to the map (only once)
         map.add_stairs(&mut rng);
+        
+        println!("Generated new map with seed: {}", seed);
         
         map
     }
@@ -1335,8 +1350,22 @@ impl TileMap {
     // Find a valid position in a room for placing stairs
     fn find_valid_position_in_room(&self, room: &Room, rng: &mut impl Rng) -> (usize, usize) {
         // Avoid edges of the room
-        let x = room.x + 1 + rng.gen_range(0..room.width.saturating_sub(2));
-        let y = room.y + 1 + rng.gen_range(0..room.height.saturating_sub(2));
+        let width_range = room.width.saturating_sub(2);
+        let height_range = room.height.saturating_sub(2);
+        
+        // If the room is too small, just use the center
+        let x = if width_range > 0 {
+            room.x + 1 + rng.gen_range(0..width_range)
+        } else {
+            room.x + room.width / 2
+        };
+        
+        let y = if height_range > 0 {
+            room.y + 1 + rng.gen_range(0..height_range)
+        } else {
+            room.y + room.height / 2
+        };
+        
         (x, y)
     }
 }
