@@ -4,7 +4,7 @@ use bevy::render::camera::ScalingMode;
 use bevy::sprite::{TextureAtlas, TextureAtlasSprite};
 use rand::seq::SliceRandom;
 use rand::Rng;
-use crate::components::{Position, Player, Npc, Tile, DialogBox};
+use crate::components::{Position, Player, Npc, Tile, DialogBox, GameTurn, TurnCounter, TurnCounterVisibility, Animal, AnimalTooltip, AnimalAnimation, AnimalNpc, AnimalType, MovementDirection};
 use crate::map::{TileMap, TileType, MAP_WIDTH, MAP_HEIGHT, GridLine, TileEntities, generate_map_visuals, toggle_grid_visibility, update_tile_visibility};
 use crate::input::InputState;
 use crate::visibility::{PlayerVisibility, update_visibility, setup_visibility_map};
@@ -12,6 +12,7 @@ use crate::systems::check_dialog_distance;
 use crate::assets::{SpriteAssets, TextureAtlases, load_sprite_assets};
 use crate::biome::{BiomeManager, BiomeType};
 use crate::dialogue::{CharacterType, generate_dialogue, generate_biome_dialogue};
+use crate::animals::{AnimalManager, spawn_animals, handle_animal_hover};
 use bevy::text::{Text2dBundle, Text, TextStyle, TextAlignment};
 
 mod components;
@@ -24,6 +25,7 @@ mod systems;
 mod assets;
 mod biome;
 mod dialogue;
+mod animals;
 
 // Use the TILE_SIZE from the input module
 use crate::input::TILE_SIZE;
@@ -127,10 +129,15 @@ fn main() {
         .init_resource::<TileEntities>()
         .init_resource::<BiomeManager>()
         .init_resource::<AnimationState>()
+        .init_resource::<GameTurn>()
+        .init_resource::<TurnCounterVisibility>()
+        .init_resource::<AnimalManager>()
         .add_systems(Startup, setup)
         .add_systems(OnEnter(GameState::InGame), (
             initialize_biome_manager,
-            spawn_game_world.after(initialize_biome_manager),
+            initialize_animal_manager,
+            spawn_game_world.after(initialize_biome_manager).after(initialize_animal_manager),
+            setup_turn_counter,
             // setup_visibility_map.after(spawn_game_world) // Commented out visibility system
         ))
         .add_systems(
@@ -143,6 +150,9 @@ fn main() {
                 // update_visibility.after(crate::input::move_player), // Commented out visibility system
                 crate::input::move_player.after(crate::input::handle_input),
                 animate_player_movement.after(crate::input::move_player),
+                process_turn_effects.after(animate_player_movement),
+                crate::animals::move_animals_system.after(process_turn_effects),
+                crate::animals::animate_animal_movement.after(crate::animals::move_animals_system),
                 check_dialog_distance.after(crate::input::move_player),
                 // update_tile_visibility.after(update_visibility), // Commented out visibility system
                 handle_npc_interaction.after(check_dialog_distance),
@@ -150,12 +160,15 @@ fn main() {
                 render_dialog_boxes.after(handle_npc_interaction),
                 regenerate_map_system.after(crate::input::handle_input),
                 toggle_grid_visibility,
+                toggle_turn_counter_visibility,
+                update_turn_counter,
                 handle_map_regeneration
                     .after(regenerate_map_system)
                     .run_if(resource_exists::<TileMap>())
                     .run_if(on_event::<RegenerateMapEvent>()),
                 handle_stairs_system.after(crate::input::handle_input),
                 // update_fade_effects, // Temporarily disabled fade effects
+                handle_animal_hover,
             )
             .chain() // Add chain() to ensure systems run in sequence
             .run_if(in_state(GameState::InGame))
@@ -254,7 +267,7 @@ fn spawn_npc(
             transform: Transform::from_xyz(
                 npc_pos.0 as f32 * TILE_SIZE + (TILE_SIZE / 2.0),
                 npc_pos.1 as f32 * TILE_SIZE + (TILE_SIZE / 2.0),
-                1.0
+                5.0  // Increased z-index to ensure NPCs render on top of floor and wall assets
             ).with_scale(Vec3::splat(1.0)),
             ..default()
         },
@@ -269,6 +282,8 @@ fn spawn_npc(
             original_scale: Vec3::splat(1.0),
             wiggle_direction: 1.0,
             wiggle_amount: 0.1, // Increased wiggle amount
+            is_animal: false,
+            animal_type: None,
         },
         Position::new(npc_pos.0, npc_pos.1),
     ));
@@ -281,7 +296,8 @@ fn spawn_game_world(
     sprite_assets: Res<SpriteAssets>,
     map: Res<TileMap>,
     biome_manager: Res<BiomeManager>,
-    existing_entities: Query<Entity, Or<(With<Tile>, With<Player>, With<Npc>, With<GridLine>)>>,
+    animal_manager: Res<AnimalManager>,
+    existing_entities: Query<Entity, Or<(With<Tile>, With<Player>, With<Npc>, With<GridLine>, With<Animal>, With<AnimalTooltip>)>>,
 ) {
     // First, clean up any existing entities
     for entity in existing_entities.iter() {
@@ -293,6 +309,9 @@ fn spawn_game_world(
     
     // Spawn grid lines
     map::spawn_grid_lines(&mut commands);
+
+    // Spawn animals
+    spawn_animals(&mut commands, &map, &texture_atlases, &animal_manager);
 
     // Find valid floor tiles for NPC spawn
     let floor_tiles: Vec<(i32, i32)> = (0..MAP_WIDTH as usize * MAP_HEIGHT as usize)
@@ -385,10 +404,12 @@ fn handle_stairs_system(
     texture_atlases: Res<TextureAtlases>,
     sprite_assets: Res<SpriteAssets>,
     asset_server: Res<AssetServer>,
-    existing_entities: Query<Entity, Or<(With<Tile>, With<Player>, With<Npc>, With<GridLine>)>>,
+    existing_entities: Query<Entity, Or<(With<Tile>, With<Player>, With<Npc>, With<GridLine>, With<Animal>, With<AnimalTooltip>)>>,
     mut tile_entities: ResMut<TileEntities>,
     biome_manager: Res<BiomeManager>,
+    animal_manager: Res<AnimalManager>,
     map: Res<TileMap>,
+    mut game_turn: ResMut<GameTurn>,
 ) {
     // First check if we have a player entity
     if player_query.is_empty() {
@@ -423,23 +444,27 @@ fn handle_stairs_system(
     }
     
     // Check if SHIFT+E was pressed
-    if keyboard_input.pressed(KeyCode::ShiftLeft) && keyboard_input.just_pressed(KeyCode::E) {
-        println!("SHIFT+E pressed");
+    let use_stairs = keyboard_input.pressed(KeyCode::ShiftLeft) && keyboard_input.just_pressed(KeyCode::E);
+    
+    if use_stairs {
+        println!("SHIFT+E pressed for stair interaction");
         
-        // Check if on down stairs
+        // Handle going down stairs
         if on_down_stairs {
             let target_level = dungeon_state.current_level_index + 1;
             println!("Stair transition DOWN initiated to level {}", target_level);
             
-            // DIRECT TRANSITION WITHOUT FADE
-            // Only proceed if the target level is valid
+            // Increment the turn counter when using stairs
+            game_turn.increment();
+            
+            // Check if we need to generate a new level
             if target_level >= dungeon_state.levels.len() {
-                // Generate a new level if needed
                 println!("Generating new level {}", target_level);
-                let new_map = TileMap::new_level(target_level, None);
+                let new_map = TileMap::new_level(target_level, Some(&map));
                 dungeon_state.levels.push(new_map);
             }
             
+            // DIRECT TRANSITION WITHOUT FADE
             // Clone the map before borrowing dungeon_state as mutable
             let new_map = dungeon_state.levels[target_level].clone();
             
@@ -449,11 +474,6 @@ fn handle_stairs_system(
             
             // Update the map resource
             commands.insert_resource(new_map.clone());
-            
-            // Store the player entity for later respawning
-            let player_entity = existing_entities.iter()
-                .find(|&e| player_query.get(e).is_ok())
-                .expect("Player entity not found");
             
             // Clean up existing entities
             for entity in existing_entities.iter() {
@@ -470,6 +490,9 @@ fn handle_stairs_system(
                 &biome_manager,
                 &mut tile_entities
             );
+            
+            // Spawn animals on the new map
+            spawn_animals(&mut commands, &new_map, &texture_atlases, &animal_manager);
             
             // Spawn a new player at the up stairs position
             if let Some(up_pos) = new_map.up_stairs_pos {
@@ -519,10 +542,13 @@ fn handle_stairs_system(
             }
         }
         
-        // Check if on up stairs
+        // Handle going up stairs
         if on_up_stairs && dungeon_state.current_level_index > 0 {
             let target_level = dungeon_state.current_level_index - 1;
             println!("Stair transition UP initiated to level {}", target_level);
+            
+            // Increment the turn counter when using stairs
+            game_turn.increment();
             
             // DIRECT TRANSITION WITHOUT FADE
             // Clone the map before borrowing dungeon_state as mutable
@@ -534,11 +560,6 @@ fn handle_stairs_system(
             
             // Update the map resource
             commands.insert_resource(new_map.clone());
-            
-            // Store the player entity for later respawning
-            let player_entity = existing_entities.iter()
-                .find(|&e| player_query.get(e).is_ok())
-                .expect("Player entity not found");
             
             // Clean up existing entities
             for entity in existing_entities.iter() {
@@ -555,6 +576,9 @@ fn handle_stairs_system(
                 &biome_manager,
                 &mut tile_entities
             );
+            
+            // Spawn animals on the new map
+            spawn_animals(&mut commands, &new_map, &texture_atlases, &animal_manager);
             
             // Spawn a new player at the down stairs position
             if let Some(down_pos) = new_map.down_stairs_pos {
@@ -615,10 +639,11 @@ fn regenerate_map_system(
     texture_atlases: Res<TextureAtlases>,
     sprite_assets: Res<SpriteAssets>,
     asset_server: Res<AssetServer>,
-    existing_entities: Query<Entity, Or<(With<Tile>, With<Player>, With<Npc>, With<GridLine>)>>,
+    existing_entities: Query<Entity, Or<(With<Tile>, With<Player>, With<Npc>, With<GridLine>, With<Animal>, With<AnimalTooltip>)>>,
     mut tile_entities: ResMut<TileEntities>,
+    mut ev_regenerate: EventWriter<RegenerateMapEvent>,
     biome_manager: Res<BiomeManager>,
-    mut events: EventWriter<RegenerateMapEvent>,
+    animal_manager: Res<AnimalManager>,
 ) {
     // Only proceed if SHIFT+R was pressed
     if !input_state.regenerate_map {
@@ -649,12 +674,10 @@ fn regenerate_map_system(
     commands.insert_resource(new_map.clone());
     
     // Send an event to notify other systems
-    events.send(RegenerateMapEvent);
+    ev_regenerate.send(RegenerateMapEvent);
     
-    // Store the player entity for later respawning
-    let player_entity = existing_entities.iter()
-        .find(|&e| player_query.get(e).is_ok())
-        .expect("Player entity not found");
+    // Store the player entity 
+    let (mut player_transform, mut player_position) = player_query.single_mut();
     
     // Clean up existing entities
     for entity in existing_entities.iter() {
@@ -671,6 +694,9 @@ fn regenerate_map_system(
         &biome_manager,
         &mut tile_entities
     );
+    
+    // Spawn animals on the new map
+    spawn_animals(&mut commands, &new_map, &texture_atlases, &animal_manager);
     
     // Spawn a new player at the spawn position
     let spawn_pos = new_map.get_spawn_position();
@@ -698,13 +724,26 @@ fn regenerate_map_system(
     
     // Find valid floor tiles for NPC spawn
     let mut npc_pos = Vec::new();
+    
+    // Define map outside the loop so it's available later
+    let map = if current_index == dungeon_state.current_level_index {
+        // Use the newly generated map for regeneration
+        dungeon_state.levels[current_index].clone()
+    } else {
+        // Use the map from the target level
+        dungeon_state.levels[current_index].clone()
+    };
+    
     for y in 0..MAP_HEIGHT {
         for x in 0..MAP_WIDTH {
-            if new_map.tiles[y][x] == TileType::Floor {
-                // Check if this is the player position or stairs
-                let is_player_pos = spawn_pos.0 == x && spawn_pos.1 == y;
-                let is_stairs = new_map.down_stairs_pos.map_or(false, |pos| pos.0 == x && pos.1 == y) ||
-                               new_map.up_stairs_pos.map_or(false, |pos| pos.0 == x && pos.1 == y);
+            if map.tiles[y][x] == TileType::Floor {
+                // Get player position
+                let (_, player_position) = player_query.single();
+                
+                // Don't spawn NPCs at player position or stairs
+                let is_player_pos = player_position.x == x as i32 && player_position.y == y as i32;
+                let is_stairs = map.down_stairs_pos.map_or(false, |pos| pos.0 == x && pos.1 == y) ||
+                               map.up_stairs_pos.map_or(false, |pos| pos.0 == x && pos.1 == y);
                 
                 if !is_player_pos && !is_stairs {
                     npc_pos.push((x as i32, y as i32));
@@ -724,10 +763,8 @@ fn regenerate_map_system(
         println!("Spawning NPC at position: ({}, {})", npc_pos.0, npc_pos.1);
         
         // Spawn NPC
-        spawn_npc(&mut commands, &texture_atlases, &sprite_assets, npc_pos, &new_map.get_biome_at(npc_pos.0 as usize, npc_pos.1 as usize));
+        spawn_npc(&mut commands, &texture_atlases, &sprite_assets, npc_pos, &map.get_biome_at(npc_pos.0 as usize, npc_pos.1 as usize));
     }
-    
-    println!("Map regeneration completed");
 }
 
 fn update_camera_zoom(
@@ -1264,7 +1301,7 @@ fn spawn_fade_effect(
     }
 }
 
-// Update the handle_map_regeneration function to handle map regeneration events
+// Update the handle_map_regeneration function to include animals
 fn handle_map_regeneration(
     mut commands: Commands,
     texture_atlases: Res<TextureAtlases>,
@@ -1272,7 +1309,8 @@ fn handle_map_regeneration(
     asset_server: Res<AssetServer>,
     map: Res<TileMap>,
     biome_manager: Res<BiomeManager>,
-    existing_entities: Query<Entity, Or<(With<Tile>, With<Player>, With<Npc>, With<GridLine>)>>,
+    animal_manager: Res<AnimalManager>,
+    existing_entities: Query<Entity, Or<(With<Tile>, With<Player>, With<Npc>, With<GridLine>, With<Animal>, With<AnimalTooltip>)>>,
     mut tile_entities: ResMut<TileEntities>,
     mut ev_regenerate: EventReader<RegenerateMapEvent>,
 ) {
@@ -1291,15 +1329,16 @@ fn handle_map_regeneration(
 fn animate_player_movement(
     time: Res<Time>,
     input_state: Res<InputState>,
-    mut player_query: Query<(Entity, &Position, &mut Transform, &mut components::PlayerAnimation), With<Player>>,
+    mut player_query: Query<(Entity, &Position, &mut Transform, &mut components::PlayerAnimation, &mut TextureAtlasSprite), With<Player>>,
     mut commands: Commands,
     map: Res<TileMap>,
     mut animation_state: ResMut<AnimationState>,
+    mut game_turn: ResMut<GameTurn>,
 ) {
-    for (entity, position, mut transform, mut animation) in player_query.iter_mut() {
+    for (entity, position, mut transform, mut animation, mut sprite) in player_query.iter_mut() {
         // If currently animating, continue the animation
         if animation.is_moving {
-            // Ensure animation state is marked as in progress
+            // Ensure animation state is marked as in progress for player movement only
             animation_state.animation_in_progress = true;
             
             // Update the timer
@@ -1332,6 +1371,8 @@ fn animate_player_movement(
             if animation.animation_timer.finished() {
                 // Reset animation state
                 animation.is_moving = false;
+                
+                // Reset the global animation state when player animation is complete
                 animation_state.animation_in_progress = false;
                 
                 // Ensure the sprite is at exactly the target position with no rotation
@@ -1375,10 +1416,22 @@ fn animate_player_movement(
                             animation.start_pos = transform.translation;
                             animation.target_pos = target_pos;
                             animation.is_moving = true;
+                            
+                            // Set the global animation state for player movement
                             animation_state.animation_in_progress = true;
                             
                             // Store the movement direction
                             animation.last_movement_direction = Some(direction);
+                            
+                            // Update facing direction for left/right movement
+                            if direction == components::MovementDirection::Left || direction == components::MovementDirection::Right {
+                                let facing_right = direction == components::MovementDirection::Right;
+                                if animation.facing_right != facing_right {
+                                    animation.facing_right = facing_right;
+                                    sprite.flip_x = facing_right;
+                                    println!("Flipping sprite to face {}", if facing_right { "right" } else { "left" });
+                                }
+                            }
                             
                             // Clear the queued direction
                             animation.queued_direction = None;
@@ -1389,6 +1442,9 @@ fn animate_player_movement(
                             
                             // Flip the wobble direction for alternating effect
                             animation.wobble_direction *= -1.0;
+                            
+                            // Increment the turn counter for queued movement
+                            game_turn.increment();
                             
                             println!("Processing queued movement in direction {:?}, animation speed: {:.2}s", 
                                      direction, animation_duration);
@@ -1446,6 +1502,9 @@ fn animate_player_movement(
                             // Flip the wobble direction for alternating effect
                             animation.wobble_direction *= -1.0;
                             
+                            // Increment the turn counter for continuous movement
+                            game_turn.increment();
+                            
                             println!("Continuing movement in direction {:?}, animation speed: {:.2}s", 
                                      direction, animation_duration);
                         }
@@ -1471,21 +1530,38 @@ fn animate_player_movement(
                 animation.start_pos = transform.translation;
                 animation.target_pos = target_pos;
                 animation.is_moving = true;
+                
+                // Set the global animation state for player movement
                 animation_state.animation_in_progress = true;
                 
-                // Store the movement direction
+                // Store the movement direction and update sprite facing
+                let mut direction = None;
+                
                 if input_state.up {
-                    animation.last_movement_direction = Some(components::MovementDirection::Up);
+                    direction = Some(components::MovementDirection::Up);
                 } else if input_state.down {
-                    animation.last_movement_direction = Some(components::MovementDirection::Down);
+                    direction = Some(components::MovementDirection::Down);
                 } else if input_state.left {
-                    animation.last_movement_direction = Some(components::MovementDirection::Left);
+                    direction = Some(components::MovementDirection::Left);
+                    if animation.facing_right {
+                        animation.facing_right = false;
+                        sprite.flip_x = false;
+                        println!("Flipping sprite to face left");
+                    }
                 } else if input_state.right {
-                    animation.last_movement_direction = Some(components::MovementDirection::Right);
+                    direction = Some(components::MovementDirection::Right);
+                    if !animation.facing_right {
+                        animation.facing_right = true;
+                        sprite.flip_x = true;
+                        println!("Flipping sprite to face right");
+                    }
                 }
+                
+                animation.last_movement_direction = direction;
                 
                 // Check for rapid key presses (within 0.3 seconds)
                 let current_time = time.elapsed_seconds_f64();
+                
                 if current_time - input_state.last_key_press_time < 0.3 {
                     // Increment rapid press count (max 5) - we still track this but don't use it for speed
                     animation.rapid_press_count = (animation.rapid_press_count + 1).min(5);
@@ -1502,10 +1578,122 @@ fn animate_player_movement(
                 animation.wobble_direction *= -1.0;
                 
                 // Print debug info
-                println!("Starting animation from {:?} to {:?} with wobble direction {}, speed: {:.2}s, rapid presses: {}", 
-                         animation.start_pos, animation.target_pos, animation.wobble_direction, 
-                         animation_duration, animation.rapid_press_count);
+                println!("Starting animation, direction: {:?}, animation speed: {:.2}s", 
+                         animation.last_movement_direction, animation_duration);
             }
         }
     }
+}
+
+// Add a new system to process turn-based effects
+fn process_turn_effects(
+    game_turn: Res<GameTurn>,
+    player_query: Query<&Position, With<Player>>,
+    npc_query: Query<(&Position, &Npc)>,
+    map: Res<TileMap>,
+) {
+    // Skip if there's no player
+    if player_query.is_empty() {
+        return;
+    }
+
+    // Get the player position
+    let player_pos = player_query.single();
+    
+    // Log turn milestones
+    if game_turn.current_turn > 0 && game_turn.current_turn % 10 == 0 {
+        println!("Turn milestone: {} turns have passed", game_turn.current_turn);
+        println!("Player is at position: ({}, {})", player_pos.x, player_pos.y);
+        
+        // Count nearby NPCs (within 5 tiles) - this could be used for future combat awareness
+        let mut nearby_npcs = 0;
+        for (npc_pos, _) in npc_query.iter() {
+            let distance = ((npc_pos.x - player_pos.x).pow(2) + (npc_pos.y - player_pos.y).pow(2)) as f32;
+            if distance.sqrt() <= 5.0 {
+                nearby_npcs += 1;
+            }
+        }
+        
+        if nearby_npcs > 0 {
+            println!("There are {} NPCs within 5 tiles of the player", nearby_npcs);
+        }
+    }
+    
+    // Note: Animal movements are now handled by the move_animals_system
+    // which is called after this system and checks the game_turn
+}
+
+// Add a system to setup the turn counter UI
+fn setup_turn_counter(mut commands: Commands, asset_server: Res<AssetServer>) {
+    // Create the turn counter text at the top of the screen
+    commands.spawn((
+        // Use a Text2dBundle for in-world rendering
+        Text2dBundle {
+            text: Text::from_section(
+                "Turn: 0",
+                TextStyle {
+                    font: asset_server.load("fonts/FiraSans-Light.ttf"),
+                    font_size: 20.0,
+                    color: Color::WHITE,
+                },
+            )
+            .with_alignment(TextAlignment::Center),
+            // Position at the top center of the screen
+            transform: Transform::from_xyz(
+                (MAP_WIDTH as f32 * TILE_SIZE) / 2.0,
+                (MAP_HEIGHT as f32 * TILE_SIZE) - 20.0,
+                100.0, // High z-index to ensure it's on top
+            ),
+            // Initially hidden
+            visibility: Visibility::Hidden,
+            ..default()
+        },
+        TurnCounter,
+    ));
+}
+
+// Add a system to toggle the turn counter visibility
+fn toggle_turn_counter_visibility(
+    input_state: Res<InputState>,
+    mut turn_counter_visibility: ResMut<TurnCounterVisibility>,
+    mut turn_counter_query: Query<&mut Visibility, With<TurnCounter>>,
+) {
+    // Toggle visibility when SHIFT+T is pressed
+    if input_state.toggle_turn_counter {
+        turn_counter_visibility.visible = !turn_counter_visibility.visible;
+        
+        // Update the visibility of the turn counter UI
+        for mut visibility in turn_counter_query.iter_mut() {
+            *visibility = if turn_counter_visibility.visible {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            };
+        }
+        
+        println!("Turn counter visibility toggled: {}", turn_counter_visibility.visible);
+    }
+}
+
+// Add a system to update the turn counter text
+fn update_turn_counter(
+    game_turn: Res<GameTurn>,
+    turn_counter_visibility: Res<TurnCounterVisibility>,
+    mut turn_counter_query: Query<&mut Text, With<TurnCounter>>,
+) {
+    // Only update if the turn counter is visible
+    if turn_counter_visibility.visible {
+        for mut text in turn_counter_query.iter_mut() {
+            text.sections[0].value = format!("Turn: {}", game_turn.current_turn);
+        }
+    }
+}
+
+// Initialize the animal manager
+fn initialize_animal_manager(
+    mut animal_manager: ResMut<AnimalManager>,
+    sprite_assets: Res<SpriteAssets>,
+) {
+    animal_manager.initialize(&sprite_assets.animal_sprites);
+    println!("Animal manager initialized with {} biomes", animal_manager.biome_animals.len());
 }
