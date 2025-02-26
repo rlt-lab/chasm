@@ -40,9 +40,44 @@ impl Default for SpriteAssets {
 /// Parse a sprite sheet metadata file and return a mapping of sprite names to indices
 fn parse_sprite_metadata(file_path: &str) -> io::Result<HashMap<String, usize>> {
     let path = Path::new("assets").join(file_path);
-    let file = File::open(path)?;
+    
+    let file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            // Create an empty map with fallbacks
+            let mut empty_map = HashMap::new();
+            // Add fallback sprites
+            empty_map.insert("wall".to_string(), 21);
+            empty_map.insert("floor".to_string(), 126);
+            empty_map.insert("door".to_string(), 338);
+            empty_map.insert("staircase down".to_string(), 343);
+            empty_map.insert("staircase up".to_string(), 344);
+            return Ok(empty_map);
+        }
+    };
+    
     let reader = io::BufReader::new(file);
     let mut sprite_map = HashMap::new();
+
+    // Determine columns per row based on the file
+    let columns_per_row = match file_path {
+        "sprites/tiles.txt" => 21,    // 672/32 = 21
+        "sprites/rogues.txt" => 6,    // 192/32 = 6
+        "sprites/monsters.txt" => 12, // 384/32 = 12
+        "sprites/items.txt" => 8,     // 256/32 = 8
+        "sprites/animals.txt" => 9,   // 288/32 = 9
+        _ => 16, // Default fallback
+    };
+
+    // Determine max index based on the file
+    let max_index = match file_path {
+        "sprites/tiles.txt" => 21 * 24,    // 21 columns × 24 rows = 504
+        "sprites/rogues.txt" => 6 * 7,     // 6 columns × 7 rows = 42
+        "sprites/monsters.txt" => 12 * 13, // 12 columns × 13 rows = 156
+        "sprites/items.txt" => 8 * 22,     // 8 columns × 22 rows = 176
+        "sprites/animals.txt" => 9 * 16,   // 9 columns × 16 rows = 144
+        _ => 256, // Default fallback
+    };
 
     for line in reader.lines() {
         let line = line?;
@@ -81,10 +116,10 @@ fn parse_sprite_metadata(file_path: &str) -> io::Result<HashMap<String, usize>> 
                     
                     // Calculate index in the sprite sheet (row * columns_per_row + column)
                     // Ensure row is 0-indexed for calculation
-                    let index = ((row - 1) * 16) + col;
+                    let index = ((row - 1) * columns_per_row) + col;
                     
-                    // Only add if the index is within bounds (16x16 grid = 256 sprites)
-                    if index < 256 {
+                    // Only add if the index is within bounds
+                    if index < max_index {
                         sprite_map.insert(name, index);
                     }
                 }
@@ -94,10 +129,28 @@ fn parse_sprite_metadata(file_path: &str) -> io::Result<HashMap<String, usize>> 
 
     // If the map is empty, add some fallback sprites
     if sprite_map.is_empty() {
-        // Add some fallback sprites
-        sprite_map.insert("wall".to_string(), 48);  // Default wall sprite
-        sprite_map.insert("floor".to_string(), 96); // Default floor sprite
-        sprite_map.insert("door".to_string(), 68);  // Default door sprite
+        // Add some fallback sprites with correct indices
+        // Wall: 2.a rough stone wall (top) = ((2-1) * 21) + 0 = 21
+        sprite_map.insert("wall".to_string(), 21);
+        
+        // Floor: 7.a blank floor (dark grey) = ((7-1) * 21) + 0 = 126
+        sprite_map.insert("floor".to_string(), 126);
+        
+        // Door: 17.c framed door 1 (shut) = ((17-1) * 21) + 2 = 338
+        sprite_map.insert("door".to_string(), 338);
+        
+        // Stairs
+        sprite_map.insert("staircase down".to_string(), 343); // 17.h
+        sprite_map.insert("staircase up".to_string(), 344);   // 17.i
+    } else {
+        // Check if we have floor tiles
+        let has_floor = sprite_map.contains_key("blank floor (dark grey)") || 
+                        sprite_map.contains_key("floor") ||
+                        sprite_map.contains_key("floor stone 1");
+                        
+        if !has_floor {
+            sprite_map.insert("floor".to_string(), 126); // 7.a blank floor
+        }
     }
 
     Ok(sprite_map)
@@ -105,7 +158,7 @@ fn parse_sprite_metadata(file_path: &str) -> io::Result<HashMap<String, usize>> 
 
 /// Load all sprite assets
 pub fn load_sprite_assets(
-    mut commands: &mut Commands,
+    commands: &mut Commands,
     asset_server: Res<AssetServer>,
     mut texture_atlases: ResMut<Assets<TextureAtlas>>,
 ) -> io::Result<()> {
@@ -130,7 +183,7 @@ pub fn load_sprite_assets(
     let tiles_atlas = TextureAtlas::from_grid(
         tiles_handle,
         Vec2::new(32.0, 32.0),
-        16, 16,
+        21, 24,  // 672/32 = 21, 768/32 = 24
         None, None
     );
     let tiles_atlas_handle = texture_atlases.add(tiles_atlas);
@@ -139,7 +192,7 @@ pub fn load_sprite_assets(
     let characters_atlas = TextureAtlas::from_grid(
         characters_handle,
         Vec2::new(32.0, 32.0),
-        16, 16,
+        6, 7,  // 192/32 = 6, 224/32 = 7
         None, None
     );
     let characters_atlas_handle = texture_atlases.add(characters_atlas);
@@ -148,7 +201,7 @@ pub fn load_sprite_assets(
     let monsters_atlas = TextureAtlas::from_grid(
         monsters_handle,
         Vec2::new(32.0, 32.0),
-        16, 16,
+        12, 13,  // 384/32 = 12, 416/32 = 13
         None, None
     );
     let monsters_atlas_handle = texture_atlases.add(monsters_atlas);
@@ -157,7 +210,7 @@ pub fn load_sprite_assets(
     let items_atlas = TextureAtlas::from_grid(
         items_handle,
         Vec2::new(32.0, 32.0),
-        16, 16,
+        8, 22,  // 256/32 = 8, 704/32 = 22
         None, None
     );
     let items_atlas_handle = texture_atlases.add(items_atlas);
@@ -166,7 +219,7 @@ pub fn load_sprite_assets(
     let animals_atlas = TextureAtlas::from_grid(
         animals_handle,
         Vec2::new(32.0, 32.0),
-        16, 16,
+        9, 16,  // 288/32 = 9, 512/32 = 16
         None, None
     );
     let animals_atlas_handle = texture_atlases.add(animals_atlas);
@@ -206,45 +259,58 @@ pub fn get_animal_sprite(sprite_assets: &SpriteAssets, name: &str) -> usize {
 
 /// Get a random floor tile sprite index
 pub fn get_random_floor_tile(sprite_assets: &SpriteAssets) -> usize {
-    use rand::seq::SliceRandom;
+    println!("DEBUG: Available tile sprites: {:?}", sprite_assets.tile_sprites.keys().collect::<Vec<_>>());
     
-    // Collect all floor tile sprites
-    let floor_sprites: Vec<&usize> = sprite_assets.tile_sprites.iter()
-        .filter(|(name, _)| name.contains("floor") || name.contains("stone") || name.contains("grass"))
-        .map(|(_, index)| index)
-        .collect();
+    // Try to get a specific floor tile
+    let floor_index_opt = sprite_assets.tile_sprites.get("blank floor (dark grey)")
+        .or_else(|| sprite_assets.tile_sprites.get("blank floor (dark purple)"))
+        .or_else(|| sprite_assets.tile_sprites.get("blank green floor"))
+        .or_else(|| sprite_assets.tile_sprites.get("floor stone 1"))
+        .or_else(|| sprite_assets.tile_sprites.get("floor stone 2"))
+        .or_else(|| sprite_assets.tile_sprites.get("floor stone 3"))
+        .or_else(|| sprite_assets.tile_sprites.get("floor"))
+        .or_else(|| sprite_assets.tile_sprites.get("stone floor 1"));
     
-    // Choose a random floor tile or use fallback
-    if floor_sprites.is_empty() {
-        // Fallback to a default floor tile index
-        96 // Default floor tile index
+    println!("DEBUG: Floor index option: {:?}", floor_index_opt);
+    
+    // Get the floor sprite index, ensuring it's not a stair sprite
+    let floor_index = if let Some(&index) = floor_index_opt {
+        index
     } else {
-        **floor_sprites.choose(&mut rand::thread_rng()).unwrap_or(&&96)
-    }
+        // If no floor tile is found, use a safe index that corresponds to a floor tile
+        // 7.a is blank floor (dark grey) at index ((7-1) * 21) + 0 = 126
+        println!("DEBUG: No floor tile found, using fallback index 126");
+        126
+    };
+    
+    println!("DEBUG: Selected floor index: {}", floor_index);
+    floor_index
 }
 
 /// Get a random wall tile sprite index
 pub fn get_random_wall_tile(sprite_assets: &SpriteAssets) -> usize {
-    use rand::seq::SliceRandom;
-    
-    // Collect all wall tile sprites
-    let wall_sprites: Vec<&usize> = sprite_assets.tile_sprites.iter()
-        .filter(|(name, _)| name.contains("wall"))
-        .map(|(_, index)| index)
-        .collect();
-    
-    // Choose a random wall tile or use fallback
-    if wall_sprites.is_empty() {
-        // Fallback to a default wall tile index
-        48 // Default wall tile index
-    } else {
-        **wall_sprites.choose(&mut rand::thread_rng()).unwrap_or(&&48)
-    }
+    *sprite_assets.tile_sprites.get("wall").unwrap_or(&0)
 }
 
-/// Get a door tile sprite index
+/// Get a door sprite index
 pub fn get_door_sprite(sprite_assets: &SpriteAssets) -> usize {
-    *sprite_assets.tile_sprites.get("framed door 1 (shut)")
-        .or_else(|| sprite_assets.tile_sprites.get("door"))
-        .unwrap_or(&68) // Default door tile index
+    *sprite_assets.tile_sprites.get("door").unwrap_or(&0)
+}
+
+/// Get stairs down sprite index
+pub fn get_stairs_down_sprite(sprite_assets: &SpriteAssets) -> usize {
+    // Try to get from sprite map first, fallback to a safe index
+    // For 17.h in a 21-column grid: ((17-1) * 21) + 7 = 343
+    *sprite_assets.tile_sprites.get("staircase down")
+        .or_else(|| sprite_assets.tile_sprites.get("stairs down"))
+        .unwrap_or(&343)
+}
+
+/// Get stairs up sprite index
+pub fn get_stairs_up_sprite(sprite_assets: &SpriteAssets) -> usize {
+    // Try to get from sprite map first, fallback to a safe index
+    // For 17.i in a 21-column grid: ((17-1) * 21) + 8 = 344
+    *sprite_assets.tile_sprites.get("staircase up")
+        .or_else(|| sprite_assets.tile_sprites.get("stairs up"))
+        .unwrap_or(&344)
 } 

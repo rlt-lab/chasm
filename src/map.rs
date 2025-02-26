@@ -2,15 +2,46 @@ use bevy::prelude::*;
 use rand::Rng;
 use rand::seq::SliceRandom;
 use crate::biome::BiomeType;
+use crate::assets::{SpriteAssets, TextureAtlases};
+use crate::visibility::{VisibilityMap, TileVisibility};
+use crate::biome::{BiomeManager, TileWalkability};
+use crate::input::TILE_SIZE;
 
 pub const MAP_WIDTH: usize = 45;
 pub const MAP_HEIGHT: usize = 25;
 
+// Rendering components
+#[derive(Component)]
+pub struct TilePos {
+    pub x: i32,
+    pub y: i32,
+}
+
+// Grid line component
+#[derive(Component)]
+pub struct GridLine;
+
+// Resource to track tile entities
+#[derive(Resource, Default)]
+pub struct TileEntities {
+    pub entities: Vec<Entity>,
+}
+
 #[derive(Component, Resource, Clone)]
 pub struct TileMap {
     pub tiles: [[TileType; MAP_WIDTH]; MAP_HEIGHT],
+    pub rooms: Vec<Room>,
     pub biomes: [[BiomeType; MAP_WIDTH]; MAP_HEIGHT],
     pub spawn_position: (usize, usize),
+    pub down_stairs_pos: Option<(usize, usize)>,
+    pub up_stairs_pos: Option<(usize, usize)>,
+    pub current_level: usize,
+}
+
+impl FromWorld for TileMap {
+    fn from_world(_world: &mut World) -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -19,20 +50,22 @@ pub enum TileType {
     Wall,
     Door,
     SecretDoor,
+    StairsDown,
+    StairsUp,
 }
 
 // Represents a rectangular room or section of the map
 #[derive(Debug, Clone)]
-struct Room {
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-    room_type: RoomType,
+pub struct Room {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+    pub room_type: RoomType,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum RoomType {
+pub enum RoomType {
     Rectangular,
     Circular,
     CrossShaped,
@@ -233,7 +266,7 @@ impl Room {
         if self.width < 8 || self.height < 8 {
             return;
         }
-        
+
         // Choose a feature type for the large hall
         match rng.gen_range(0..4) {
             0 => self.add_central_feature(tiles, rng),
@@ -331,40 +364,81 @@ impl Room {
 impl TileMap {
     pub fn new() -> Self {
         let mut rng = rand::thread_rng();
+        let (tiles, rooms, biomes, spawn_position) = Self::generate_map(&mut rng);
+        
+        let mut map = Self {
+            tiles,
+            rooms,
+            biomes,
+            spawn_position,
+            down_stairs_pos: None,
+            up_stairs_pos: None,
+            current_level: 0,
+        };
+        
+        // Add stairs to the map (only once)
+        map.add_stairs(&mut rng);
+        
+        map
+    }
+    
+    // Create a new map for a specific level
+    pub fn new_level(level: usize, previous_map: Option<&TileMap>) -> Self {
+        let mut rng = rand::thread_rng();
+        let (tiles, rooms, biomes, spawn_position) = Self::generate_map(&mut rng);
+        
+        let mut map = Self {
+            tiles,
+            rooms,
+            biomes,
+            spawn_position,
+            down_stairs_pos: None,
+            up_stairs_pos: None,
+            current_level: level,
+        };
+
+        if let Some(_prev_map) = previous_map {
+            // TODO: Use previous map to influence generation
+        }
+
+        // Add stairs to the map (only once)
+        map.add_stairs(&mut rng);
+        
+        map
+    }
+    
+    fn generate_map(rng: &mut impl Rng) -> ([[TileType; MAP_WIDTH]; MAP_HEIGHT], Vec<Room>, [[BiomeType; MAP_WIDTH]; MAP_HEIGHT], (usize, usize)) {
         let mut tiles = [[TileType::Wall; MAP_WIDTH]; MAP_HEIGHT];
-        let mut biomes = [[BiomeType::Stone; MAP_WIDTH]; MAP_HEIGHT]; // Default biome
+        let mut biomes = [[BiomeType::Caves; MAP_WIDTH]; MAP_HEIGHT]; // Default biome
         
         // Generate rooms
-        let rooms = Self::generate_rooms(&mut rng);
+        let rooms = Self::generate_rooms(rng);
         
         // Carve out rooms
         for room in &rooms {
-            room.carve(&mut tiles, &mut rng);
+            room.carve(&mut tiles, rng);
         }
         
         // Connect rooms with corridors
-        Self::connect_rooms(&mut tiles, &rooms, &mut rng);
-        
-        // Add doors between rooms and corridors
-        Self::add_doors(&mut tiles, &rooms, &mut rng);
+        Self::connect_rooms(&mut tiles, &rooms, rng);
         
         // Add secret rooms
-        Self::add_secret_rooms(&mut tiles, &rooms, &mut rng);
+        Self::add_secret_rooms(&mut tiles, &rooms, rng);
         
         // Add extra corridors for more connectivity
-        Self::add_extra_corridors(&mut tiles, &rooms, &mut rng);
+        Self::add_extra_corridors(&mut tiles, &rooms, rng);
+        
+        // Add doors between rooms and corridors
+        // Commented out to prevent door generation until ready to implement
+        // Self::add_doors(&mut tiles, &rooms, rng);
         
         // Assign biomes to different regions of the map
-        assign_biomes(&mut biomes, &rooms, &mut rng);
+        assign_biomes(&mut biomes, &rooms, rng);
         
         // Find a valid spawn position (a floor tile)
         let spawn_position = Self::find_spawn_position(&tiles);
         
-        Self {
-            tiles,
-            biomes,
-            spawn_position,
-        }
+        (tiles, rooms, biomes, spawn_position)
     }
     
     fn generate_rooms(rng: &mut impl Rng) -> Vec<Room> {
@@ -376,7 +450,7 @@ impl TileMap {
         // Track attempts to avoid infinite loops
         let mut attempts = 0;
         let max_attempts = 100;
-        
+
         while rooms.len() < num_rooms && attempts < max_attempts {
             attempts += 1;
             
@@ -687,7 +761,7 @@ impl TileMap {
         }
     }
     
-    fn add_secret_rooms(tiles: &mut [[TileType; MAP_WIDTH]; MAP_HEIGHT], rooms: &[Room], rng: &mut impl Rng) {
+    fn add_secret_rooms(tiles: &mut [[TileType; MAP_WIDTH]; MAP_HEIGHT], _rooms: &[Room], rng: &mut impl Rng) {
         // Try to add 1-3 secret rooms
         let num_secret_rooms = rng.gen_range(1..=3);
         
@@ -796,7 +870,7 @@ impl TileMap {
         self.spawn_position
     }
 
-    fn add_extra_corridors(tiles: &mut [[TileType; MAP_WIDTH]; MAP_HEIGHT], rooms: &[Room], rng: &mut impl Rng) {
+    fn add_extra_corridors(tiles: &mut [[TileType; MAP_WIDTH]; MAP_HEIGHT], _rooms: &[Room], rng: &mut impl Rng) {
         // Add 2-4 extra corridors that aren't directly connecting rooms
         let num_extra_corridors = rng.gen_range(2..=4);
         
@@ -1117,13 +1191,13 @@ impl TileMap {
         if x < MAP_WIDTH && y < MAP_HEIGHT {
             self.biomes[y][x]
         } else {
-            BiomeType::Stone // Default biome
+            BiomeType::Caves // Default biome
         }
     }
 
-    fn add_doors(tiles: &mut [[TileType; MAP_WIDTH]; MAP_HEIGHT], rooms: &[Room], rng: &mut impl Rng) {
+    fn add_doors(tiles: &mut [[TileType; MAP_WIDTH]; MAP_HEIGHT], _rooms: &[Room], rng: &mut impl Rng) {
         // Add doors between rooms and corridors
-        for room in rooms {
+        for room in _rooms {
             // Try to add doors on each side of the room
             // Top side
             for x in room.x + 1..room.x + room.width - 1 {
@@ -1186,122 +1260,354 @@ impl TileMap {
             }
         }
     }
+
+    // Add stairs to the map
+    fn add_stairs(&mut self, rng: &mut impl Rng) {
+        // Clear any existing stairs first
+        for y in 0..MAP_HEIGHT {
+            for x in 0..MAP_WIDTH {
+                if self.tiles[y][x] == TileType::StairsDown || self.tiles[y][x] == TileType::StairsUp {
+                    self.tiles[y][x] = TileType::Floor;
+                }
+            }
+        }
+        
+        // Reset stairs positions
+        self.down_stairs_pos = None;
+        self.up_stairs_pos = None;
+        
+        // Place down stairs in a random room
+        let down_stairs_room = &self.rooms[rng.gen_range(0..self.rooms.len())];
+        let (down_x, down_y) = self.find_valid_position_in_room(down_stairs_room, rng);
+        self.tiles[down_y][down_x] = TileType::StairsDown;
+        
+        // Store the position of the down stairs
+        self.down_stairs_pos = Some((down_x, down_y));
+        println!("Placed DOWN stairs at position: ({}, {})", down_x, down_y);
+        
+        // If this is not the first level, place up stairs
+        if self.current_level > 0 {
+            // Place up stairs in a different room if possible
+            let mut up_stairs_room_idx;
+            let rooms_len = self.rooms.len();
+            
+            if rooms_len > 1 {
+                // Try to find a different room for up stairs
+                loop {
+                    up_stairs_room_idx = rng.gen_range(0..rooms_len);
+                    if &self.rooms[up_stairs_room_idx] as *const _ != down_stairs_room as *const _ {
+                        break;
+                    }
+                }
+            } else {
+                // Only one room, use it but ensure stairs are not too close
+                up_stairs_room_idx = 0;
+            }
+            
+            let up_stairs_room = &self.rooms[up_stairs_room_idx];
+            let (up_x, up_y) = self.find_valid_position_in_room(up_stairs_room, rng);
+            
+            // Ensure up and down stairs are not at the same position
+            if up_x == down_x && up_y == down_y {
+                // Adjust position slightly
+                let offsets = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+                for (dx, dy) in offsets.iter() {
+                    let new_x = (up_x as isize + dx) as usize;
+                    let new_y = (up_y as isize + dy) as usize;
+                    
+                    if new_x > 0 && new_x < MAP_WIDTH - 1 && 
+                       new_y > 0 && new_y < MAP_HEIGHT - 1 &&
+                       self.tiles[new_y][new_x] == TileType::Floor {
+                        self.tiles[new_y][new_x] = TileType::StairsUp;
+                        self.up_stairs_pos = Some((new_x, new_y));
+                        println!("Placed UP stairs at position: ({}, {})", new_x, new_y);
+                        return;
+                    }
+                }
+            }
+            
+            self.tiles[up_y][up_x] = TileType::StairsUp;
+            self.up_stairs_pos = Some((up_x, up_y));
+            println!("Placed UP stairs at position: ({}, {})", up_x, up_y);
+        }
+    }
+    
+    // Find a valid position in a room for placing stairs
+    fn find_valid_position_in_room(&self, room: &Room, rng: &mut impl Rng) -> (usize, usize) {
+        // Avoid edges of the room
+        let x = room.x + 1 + rng.gen_range(0..room.width.saturating_sub(2));
+        let y = room.y + 1 + rng.gen_range(0..room.height.saturating_sub(2));
+        (x, y)
+    }
 }
 
 // Assign biomes to different regions of the map
 fn assign_biomes(biomes: &mut [[BiomeType; MAP_WIDTH]; MAP_HEIGHT], rooms: &[Room], rng: &mut impl Rng) {
-    // Decide if the map will have 1 or 2 biomes
-    let biome_count = if rng.gen_bool(0.3) { 1 } else { 2 };
-    
-    // Select the biomes for this map
+    // Select a single biome for the entire map based on the level
+    // We'll use a deterministic approach based on the current level
     let available_biomes = [
-        BiomeType::Stone,
-        BiomeType::Dirt,
+        BiomeType::Caves,
+        BiomeType::Groves,
+        BiomeType::Labyrinth,
         BiomeType::Catacombs,
-        BiomeType::Grass,
-        BiomeType::Igneous,
     ];
     
-    // Randomly select 1 or 2 biomes
-    let mut map_biomes = Vec::with_capacity(biome_count);
+    // Select a single biome for the entire map
+    let map_biome = available_biomes[rng.gen_range(0..available_biomes.len())];
     
-    // Always include at least one biome
-    let first_biome = available_biomes[rng.gen_range(0..available_biomes.len())];
-    map_biomes.push(first_biome);
+    println!("Map generated with biome: {:?}", map_biome);
     
-    // Add a second biome if needed, ensuring it's different from the first
-    if biome_count == 2 {
-        let mut second_biome;
-        loop {
-            second_biome = available_biomes[rng.gen_range(0..available_biomes.len())];
-            if second_biome != first_biome {
-                break;
-            }
-        }
-        map_biomes.push(second_biome);
-    }
-    
-    println!("Map generated with {} biome(s): {:?}", biome_count, map_biomes);
-    
-    // Assign biomes to rooms
-    for (i, room) in rooms.iter().enumerate() {
-        // Choose a biome for this room from our selected biomes
-        let biome_index = if biome_count == 1 {
-            0 // Only one biome available
-        } else {
-            // Alternate biomes or choose randomly
-            // Using modulo to create patterns of biome distribution
-            i % biome_count
-        };
-        
-        let biome = map_biomes[biome_index];
-        
+    // Assign the same biome to all rooms
+    for room in rooms {
         // Apply the biome to the room area
         for y in room.y..(room.y + room.height) {
             for x in room.x..(room.x + room.width) {
                 if y < MAP_HEIGHT && x < MAP_WIDTH {
-                    biomes[y][x] = biome;
+                    biomes[y][x] = map_biome;
                 }
             }
         }
     }
     
-    // Create some larger biome regions by expanding from rooms
-    let mut visited = [[false; MAP_WIDTH]; MAP_HEIGHT];
-    
-    // Mark room areas as visited
-    for room in rooms {
-        for y in room.y..(room.y + room.height) {
-            for x in room.x..(room.x + room.width) {
-                if y < MAP_HEIGHT && x < MAP_WIDTH {
-                    visited[y][x] = true;
-                }
-            }
-        }
-    }
-    
-    // Expand biomes to nearby areas
-    for _ in 0..3 { // Multiple passes to expand further
-        let mut new_visited = visited.clone();
-        
-        for y in 1..MAP_HEIGHT-1 {
-            for x in 1..MAP_WIDTH-1 {
-                if !visited[y][x] {
-                    // Check neighbors
-                    let mut neighbor_biomes = Vec::new();
-                    
-                    if visited[y-1][x] {
-                        neighbor_biomes.push(biomes[y-1][x]);
-                    }
-                    if visited[y+1][x] {
-                        neighbor_biomes.push(biomes[y+1][x]);
-                    }
-                    if visited[y][x-1] {
-                        neighbor_biomes.push(biomes[y][x-1]);
-                    }
-                    if visited[y][x+1] {
-                        neighbor_biomes.push(biomes[y][x+1]);
-                    }
-                    
-                    // If we have neighbors with biomes, choose one
-                    if !neighbor_biomes.is_empty() {
-                        let chosen_biome = *neighbor_biomes.choose(rng).unwrap();
-                        biomes[y][x] = chosen_biome;
-                        new_visited[y][x] = true;
-                    }
-                }
-            }
-        }
-        
-        visited = new_visited;
-    }
-    
-    // Fill any remaining areas with the default biome (first selected biome)
+    // Also assign the biome to corridors and other areas
     for y in 0..MAP_HEIGHT {
         for x in 0..MAP_WIDTH {
-            if !visited[y][x] {
-                biomes[y][x] = map_biomes[0];
-            }
+            biomes[y][x] = map_biome;
+        }
+    }
+}
+
+// Rendering functions moved from rendering.rs
+pub fn spawn_tiles(
+    commands: &mut Commands,
+    map: &TileMap,
+    texture_atlases: &Res<TextureAtlases>,
+    sprite_assets: &Res<SpriteAssets>,
+    biome_manager: Option<&Res<BiomeManager>>,
+) -> Vec<Entity> {
+    let mut rng = rand::thread_rng();
+    let mut tile_entities = Vec::new();
+    
+    for y in 0..MAP_HEIGHT {
+        for x in 0..MAP_WIDTH {
+            let (x_pos, y_pos) = (
+                x as f32 * TILE_SIZE + (TILE_SIZE / 2.0),
+                y as f32 * TILE_SIZE + (TILE_SIZE / 2.0)
+            );
+
+            // Get the biome for this tile
+            let biome = map.get_biome_at(x, y);
+            
+            // Convert TileType to TileWalkability for rendering
+            // This is critical - the walkability MUST match the tile type
+            let walkability = match map.tiles[y][x] {
+                TileType::Floor => TileWalkability::Walkable,
+                TileType::Wall => TileWalkability::Blocked,
+                TileType::Door => TileWalkability::Door,
+                TileType::SecretDoor => TileWalkability::Door,
+                TileType::StairsDown => TileWalkability::Walkable,
+                TileType::StairsUp => TileWalkability::Walkable,
+            };
+            
+            // Determine sprite index based on tile type and biome
+            // IMPORTANT: We must ensure the sprite matches the actual tile type
+            let (sprite_index, z_pos) = if let Some(biome_mgr) = biome_manager {
+                match map.tiles[y][x] {
+                    TileType::Wall => {
+                        if let Some(tile_info) = biome_mgr.get_wall_tile_for_position(biome, x, y, map, &mut rng) {
+                            // Verify the walkability matches
+                            if tile_info.walkability == TileWalkability::Blocked {
+                                (tile_info.sprite_index, 1.0)
+                            } else {
+                                // Fallback to a generic wall tile if walkability doesn't match
+                                (crate::assets::get_random_wall_tile(sprite_assets), 1.0)
+                            }
+                        } else {
+                            (crate::assets::get_random_wall_tile(sprite_assets), 1.0)
+                        }
+                    }
+                    TileType::Floor => {
+                        if let Some(tile_info) = biome_mgr.get_varied_floor_tile(biome, x, y, &mut rng) {
+                            // Verify the walkability matches
+                            if tile_info.walkability == TileWalkability::Walkable {
+                                (tile_info.sprite_index, 0.0)
+                            } else {
+                                // Fallback to a generic floor tile if walkability doesn't match
+                                (crate::assets::get_random_floor_tile(sprite_assets), 0.0)
+                            }
+                        } else {
+                            // Fallback to generic floor tile if biome-specific one isn't available
+                            (crate::assets::get_random_floor_tile(sprite_assets), 0.0)
+                        }
+                    },
+                    TileType::Door => {
+                        if let Some(tile_info) = biome_mgr.get_door_tile(biome) {
+                            // Verify the walkability matches
+                            if tile_info.walkability == TileWalkability::Door {
+                                (tile_info.sprite_index, 1.0)
+                            } else {
+                                // Fallback to a generic door tile if walkability doesn't match
+                                (crate::assets::get_door_sprite(sprite_assets), 1.0)
+                            }
+                        } else {
+                            (crate::assets::get_door_sprite(sprite_assets), 1.0)
+                        }
+                    },
+                    TileType::SecretDoor => {
+                        // Secret doors look like walls but can be walked through
+                        if let Some(tile_info) = biome_mgr.get_wall_tile_for_position(biome, x, y, map, &mut rng) {
+                            (tile_info.sprite_index, 1.0)
+                        } else {
+                            (crate::assets::get_random_wall_tile(sprite_assets), 1.0)
+                        }
+                    },
+                    TileType::StairsDown => {
+                        // Always use stairs down sprite for stairs down tiles
+                        if let Some(tile_info) = biome_mgr.get_stairs_down_tile(biome) {
+                            (tile_info.sprite_index, 0.0)
+                        } else {
+                            (crate::assets::get_stairs_down_sprite(sprite_assets), 0.0)
+                        }
+                    },
+                    TileType::StairsUp => {
+                        // Always use stairs up sprite for stairs up tiles
+                        if let Some(tile_info) = biome_mgr.get_stairs_up_tile(biome) {
+                            (tile_info.sprite_index, 0.0)
+                        } else {
+                            (crate::assets::get_stairs_up_sprite(sprite_assets), 0.0)
+                        }
+                    },
+                }
+            } else {
+                match map.tiles[y][x] {
+                    TileType::Wall => (crate::assets::get_random_wall_tile(sprite_assets), 1.0),
+                    TileType::Floor => (crate::assets::get_random_floor_tile(sprite_assets), 0.0),
+                    TileType::Door => (crate::assets::get_door_sprite(sprite_assets), 1.0),
+                    TileType::SecretDoor => (crate::assets::get_random_wall_tile(sprite_assets), 1.0),
+                    TileType::StairsDown => (crate::assets::get_stairs_down_sprite(sprite_assets), 0.0),
+                    TileType::StairsUp => (crate::assets::get_stairs_up_sprite(sprite_assets), 0.0),
+                }
+            };
+
+            // Spawn the tile entity with the correct components
+            let entity = commands.spawn((
+                SpriteSheetBundle {
+                    texture_atlas: texture_atlases.tiles.clone(),
+                    sprite: bevy::sprite::TextureAtlasSprite {
+                        index: sprite_index,
+                        color: Color::rgba(1.0, 1.0, 1.0, 1.0), // Always fully visible for debugging
+                        ..default()
+                    },
+                    transform: Transform::from_translation(Vec3::new(x_pos, y_pos, z_pos)),
+                    ..default()
+                },
+                TilePos { x: x as i32, y: y as i32 },
+                TileVisibility {
+                    visible: true, // Always visible for debugging
+                    previously_seen: true, // Always previously seen for debugging
+                },
+                crate::components::Tile {
+                    tile_type: map.tiles[y][x],
+                    walkability,
+                    biome,
+                },
+            )).id();
+            
+            // Store the entity ID
+            tile_entities.push(entity);
+        }
+    }
+    
+    // Return the list of entity IDs
+    tile_entities
+}
+
+pub fn spawn_grid_lines(commands: &mut Commands) {
+    // Spawn horizontal grid lines
+    for y in 0..=MAP_HEIGHT {
+        let y_pos = y as f32 * TILE_SIZE;
+        commands.spawn((
+            SpriteBundle {
+                sprite: Sprite {
+                    color: Color::rgba(0.5, 0.5, 0.5, 0.2),
+                    custom_size: Some(Vec2::new(MAP_WIDTH as f32 * TILE_SIZE, 1.0)),
+                    ..default()
+                },
+                transform: Transform::from_xyz(MAP_WIDTH as f32 * TILE_SIZE / 2.0, y_pos, 2.0),
+                visibility: Visibility::Hidden,
+                ..default()
+            },
+            GridLine,
+        ));
+    }
+    
+    // Spawn vertical grid lines
+    for x in 0..=MAP_WIDTH {
+        let x_pos = x as f32 * TILE_SIZE;
+        commands.spawn((
+            SpriteBundle {
+                sprite: Sprite {
+                    color: Color::rgba(0.5, 0.5, 0.5, 0.2),
+                    custom_size: Some(Vec2::new(1.0, MAP_HEIGHT as f32 * TILE_SIZE)),
+                    ..default()
+                },
+                transform: Transform::from_xyz(x_pos, MAP_HEIGHT as f32 * TILE_SIZE / 2.0, 2.0),
+                visibility: Visibility::Hidden,
+                ..default()
+            },
+            GridLine,
+        ));
+    }
+}
+
+pub fn toggle_grid_visibility(
+    _grid_query: Query<&mut Visibility, With<GridLine>>,
+    _keyboard_input: Res<Input<KeyCode>>,
+) {
+    // Grid visibility toggle is currently disabled
+}
+
+pub fn generate_map_visuals(
+    commands: &mut Commands,
+    map: &TileMap,
+    _asset_server: &Res<AssetServer>,
+    sprite_assets: &Res<SpriteAssets>,
+    texture_atlases: &Res<TextureAtlases>,
+    biome_manager: &Res<BiomeManager>,
+    tile_entities: &mut TileEntities,
+) {
+    // Clear existing tile entities - but don't try to despawn them
+    // They might have already been despawned by handle_map_regeneration
+    tile_entities.entities.clear();
+    
+    // Spawn new tiles and store the entity IDs
+    let new_entities = spawn_tiles(commands, map, texture_atlases, sprite_assets, Some(biome_manager));
+    tile_entities.entities = new_entities;
+    
+    // Spawn grid lines
+    spawn_grid_lines(commands);
+    
+    // Log for debugging
+    println!("Map visuals regenerated with {} tile entities", tile_entities.entities.len());
+}
+
+pub fn update_tile_visibility(
+    visibility_map: Res<VisibilityMap>,
+    mut query: Query<(&TilePos, &mut bevy::sprite::TextureAtlasSprite, &mut TileVisibility)>,
+) {
+    for (pos, mut sprite, mut tile_vis) in query.iter_mut() {
+        if visibility_map.visible_tiles[pos.y as usize][pos.x as usize] {
+            sprite.color.set_a(1.0);
+            tile_vis.previously_seen = true;
+            tile_vis.visible = true;
+        } else if visibility_map.previously_seen[pos.y as usize][pos.x as usize] {
+            sprite.color.set_a(0.3); // Dimmer for previously seen tiles
+            tile_vis.previously_seen = true;
+            tile_vis.visible = false;
+        } else {
+            sprite.color.set_a(0.0); // Completely invisible
+            tile_vis.previously_seen = false;
+            tile_vis.visible = false;
         }
     }
 }

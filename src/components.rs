@@ -27,9 +27,9 @@ pub struct Tile {
 impl Default for Tile {
     fn default() -> Self {
         Self {
-            tile_type: TileType::Wall,
-            walkability: TileWalkability::Blocked,
-            biome: BiomeType::Stone,
+            tile_type: TileType::Floor,
+            walkability: TileWalkability::Walkable,
+            biome: BiomeType::Caves,
         }
     }
 }
@@ -38,6 +38,9 @@ impl Default for Tile {
 pub struct Npc {
     pub speaking: bool,
     pub dialog_text: String,
+    pub name: String,
+    pub dialog: Vec<String>,
+    pub current_dialog_index: usize,
 }
 
 impl Default for Npc {
@@ -45,6 +48,9 @@ impl Default for Npc {
         Self {
             speaking: false,
             dialog_text: "Hello!".to_string(),
+            name: "NPC".to_string(),
+            dialog: vec!["Hello!".to_string()],
+            current_dialog_index: 0,
         }
     }
 }

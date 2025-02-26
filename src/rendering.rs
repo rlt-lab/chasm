@@ -1,9 +1,10 @@
 use bevy::prelude::*;
+use bevy::sprite::TextureAtlasSprite;
 use crate::map::{TileMap, TileType, MAP_WIDTH, MAP_HEIGHT};
 use crate::assets::{SpriteAssets, TextureAtlases};
 use crate::visibility::{VisibilityMap, TileVisibility};
-use crate::biome::{BiomeManager, BiomeType, TileWalkability};
-use rand::Rng;
+use crate::biome::{BiomeManager, TileWalkability};
+use crate::input::TILE_SIZE;
 
 #[derive(Component)]
 pub struct TilePos {
@@ -11,7 +12,15 @@ pub struct TilePos {
     pub y: usize,
 }
 
-const TILE_SIZE: f32 = 32.0;
+// Grid line component
+#[derive(Component)]
+pub struct GridLine;
+
+// Resource to track tile entities
+#[derive(Resource, Default)]
+pub struct TileEntities {
+    pub entities: Vec<Entity>,
+}
 
 pub fn spawn_tiles(
     commands: &mut Commands,
@@ -32,32 +41,30 @@ pub fn spawn_tiles(
             // Get the biome for this tile
             let biome = map.get_biome_at(x, y);
             
-            // Determine walkability based on tile type
+            // Convert TileType to TileWalkability for rendering
             let walkability = match map.tiles[y][x] {
                 TileType::Floor => TileWalkability::Walkable,
                 TileType::Wall => TileWalkability::Blocked,
                 TileType::Door => TileWalkability::Door,
-                TileType::SecretDoor => TileWalkability::Blocked, // Secret doors start as blocked
+                TileType::SecretDoor => TileWalkability::Door,
+                TileType::StairsDown => TileWalkability::Walkable,
+                TileType::StairsUp => TileWalkability::Walkable,
             };
             
             // Determine sprite index based on tile type and biome
             let (sprite_index, z_pos) = if let Some(biome_mgr) = biome_manager {
                 match map.tiles[y][x] {
                     TileType::Wall => {
-                        // Use the new position-aware wall tile selection
                         if let Some(tile_info) = biome_mgr.get_wall_tile_for_position(biome, x, y, map, &mut rng) {
                             (tile_info.sprite_index, 1.0)
                         } else {
-                            // Fallback to default wall
                             (crate::assets::get_random_wall_tile(sprite_assets), 1.0)
                         }
                     }
                     TileType::Floor => {
-                        // Use the new varied floor tile selection for more visual interest
                         if let Some(tile_info) = biome_mgr.get_varied_floor_tile(biome, x, y, &mut rng) {
                             (tile_info.sprite_index, 0.0)
                         } else {
-                            // Fallback to default floor
                             (crate::assets::get_random_floor_tile(sprite_assets), 0.0)
                         }
                     }
@@ -65,28 +72,39 @@ pub fn spawn_tiles(
                         if let Some(tile_info) = biome_mgr.get_door_tile(biome) {
                             (tile_info.sprite_index, 1.0)
                         } else {
-                            // Fallback to default door
                             (crate::assets::get_door_sprite(sprite_assets), 1.0)
                         }
                     }
                     TileType::SecretDoor => {
-                        // Secret doors look like walls until discovered
-                        // Use the new position-aware wall tile selection for secret doors too
                         if let Some(tile_info) = biome_mgr.get_wall_tile_for_position(biome, x, y, map, &mut rng) {
                             (tile_info.sprite_index, 1.0)
                         } else {
-                            // Fallback to default wall
                             (crate::assets::get_random_wall_tile(sprite_assets), 1.0)
+                        }
+                    }
+                    TileType::StairsDown => {
+                        if let Some(tile_info) = biome_mgr.get_stairs_down_tile(biome) {
+                            (tile_info.sprite_index, 0.0)
+                        } else {
+                            (crate::assets::get_stairs_down_sprite(sprite_assets), 0.0)
+                        }
+                    }
+                    TileType::StairsUp => {
+                        if let Some(tile_info) = biome_mgr.get_stairs_up_tile(biome) {
+                            (tile_info.sprite_index, 0.0)
+                        } else {
+                            (crate::assets::get_stairs_up_sprite(sprite_assets), 0.0)
                         }
                     }
                 }
             } else {
-                // Fallback to the old system if biome manager is not available
                 match map.tiles[y][x] {
                     TileType::Wall => (crate::assets::get_random_wall_tile(sprite_assets), 1.0),
                     TileType::Floor => (crate::assets::get_random_floor_tile(sprite_assets), 0.0),
                     TileType::Door => (crate::assets::get_door_sprite(sprite_assets), 1.0),
                     TileType::SecretDoor => (crate::assets::get_random_wall_tile(sprite_assets), 1.0),
+                    TileType::StairsDown => (crate::assets::get_stairs_down_sprite(sprite_assets), 0.0),
+                    TileType::StairsUp => (crate::assets::get_stairs_up_sprite(sprite_assets), 0.0),
                 }
             };
 
@@ -135,4 +153,36 @@ pub fn update_tile_visibility(
             tile_vis.visible = false;
         }
     }
+}
+
+// Function to spawn grid lines
+pub fn spawn_grid_lines(_commands: &mut Commands) {
+    // Grid lines are currently disabled
+}
+
+// Function to toggle grid visibility
+pub fn toggle_grid_visibility(
+    _grid_query: Query<&mut Visibility, With<GridLine>>,
+    _keyboard_input: Res<Input<KeyCode>>,
+) {
+    // Grid visibility toggle is currently disabled
+}
+
+pub fn generate_map_visuals(
+    commands: &mut Commands,
+    map: &TileMap,
+    _asset_server: &Res<AssetServer>,
+    sprite_assets: &Res<SpriteAssets>,
+    texture_atlases: &Res<TextureAtlases>,
+    biome_manager: &Res<BiomeManager>,
+    tile_entities: &mut TileEntities,
+) {
+    // Clear existing tile entities
+    tile_entities.entities.clear();
+    
+    // Spawn new tiles
+    spawn_tiles(commands, map, texture_atlases, sprite_assets, Some(biome_manager));
+    
+    // Spawn grid lines
+    spawn_grid_lines(commands);
 }
